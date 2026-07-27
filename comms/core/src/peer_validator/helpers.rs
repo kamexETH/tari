@@ -25,6 +25,7 @@ use log::debug;
 
 use crate::{
     multiaddr::{Multiaddr, Protocol},
+    net_address::is_external_address,
     peer_manager::{NodeId, PeerIdentityClaim},
     peer_validator::{PeerValidatorConfig, error::PeerValidatorError},
     types::CommsPublicKey,
@@ -32,24 +33,29 @@ use crate::{
 
 const LOG_TARGET: &str = "comms::peer_validator";
 
-/// Checks that the given peer addresses are well-formed and valid. If allow_test_addrs is false, all localhost and
-/// memory addresses will be rejected.
+/// Checks that the given peer addresses are well-formed and valid. If test addresses are not allowed, local, private
+/// and memory addresses are rejected.
 pub fn validate_addresses(config: &PeerValidatorConfig, addresses: &[Multiaddr]) -> Result<(), PeerValidatorError> {
     if addresses.is_empty() {
         debug!(target: LOG_TARGET, "validate_addresses - no addresses to validate.");
         return Ok(());
     }
 
+    validate_address_count(config, addresses)?;
+    for addr in addresses {
+        validate_address(addr, config.allow_test_addresses)?;
+    }
+
+    Ok(())
+}
+
+fn validate_address_count(config: &PeerValidatorConfig, addresses: &[Multiaddr]) -> Result<(), PeerValidatorError> {
     if addresses.len() > config.max_permitted_peer_addresses_per_claim {
         return Err(PeerValidatorError::PeerIdentityTooManyAddresses {
             length: addresses.len(),
             max: config.max_permitted_peer_addresses_per_claim,
         });
     }
-    for addr in addresses {
-        validate_address(addr, config.allow_test_addresses)?;
-    }
-
     Ok(())
 }
 
@@ -65,6 +71,13 @@ pub fn validate_peer_identity_claim(
     claim: &PeerIdentityClaim,
 ) -> Result<(), PeerValidatorError> {
     validate_addresses(config, &claim.addresses)?;
+    validate_peer_identity_claim_signature(public_key, claim)
+}
+
+fn validate_peer_identity_claim_signature(
+    public_key: &CommsPublicKey,
+    claim: &PeerIdentityClaim,
+) -> Result<(), PeerValidatorError> {
     if let Ok(true) = claim.is_valid(public_key) {
         Ok(())
     } else {
@@ -73,6 +86,49 @@ pub fn validate_peer_identity_claim(
         })
     }
 }
+
+/// Verifies a signed claim and returns only the addresses permitted by the
+/// validator configuration.
+///
+/// Discovery can safely retain a peer that advertises both reachable and local
+/// addresses: the signature is checked against the original, unmodified claim,
+/// then invalid addresses are omitted from the peer database.
+pub fn validate_and_filter_peer_identity_claim_addresses(
+    config: &PeerValidatorConfig,
+    public_key: &CommsPublicKey,
+    claim: &PeerIdentityClaim,
+) -> Result<Vec<Multiaddr>, PeerValidatorError> {
+    validate_address_count(config, &claim.addresses)?;
+    for addr in &claim.addresses {
+        // Reject malformed or unsupported addresses before the more expensive
+        // signature verification. Passing `true` permits well-formed local
+        // transports for the filtering step.
+        validate_address(addr, true)?;
+    }
+    validate_peer_identity_claim_signature(public_key, claim)?;
+
+    if config.allow_test_addresses {
+        return Ok(claim.addresses.clone());
+    }
+
+    let mut valid_addresses = Vec::with_capacity(claim.addresses.len());
+    for addr in &claim.addresses {
+        match validate_address(addr, false) {
+            Ok(()) => valid_addresses.push(addr.clone()),
+            Err(err) => {
+                debug!(
+                    target: LOG_TARGET,
+                    "Discarding disallowed address '{}' from a valid peer claim: {}",
+                    addr,
+                    err
+                );
+            },
+        }
+    }
+
+    Ok(valid_addresses)
+}
+
 fn validate_address(addr: &Multiaddr, allow_test_addrs: bool) -> Result<(), PeerValidatorError> {
     let mut addr_iter = addr.iter();
     let proto = addr_iter
@@ -80,6 +136,13 @@ fn validate_address(addr: &Multiaddr, allow_test_addrs: bool) -> Result<(), Peer
         .ok_or_else(|| PeerValidatorError::InvalidMultiaddr("Multiaddr was empty".to_string()))?;
 
     match proto {
+        Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)
+            if !allow_test_addrs && !is_external_address(addr) =>
+        {
+            Err(PeerValidatorError::InvalidMultiaddr(
+                "Non-global DNS addresses are invalid".to_string(),
+            ))
+        },
         Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
             let tcp = addr_iter.next().ok_or_else(|| {
                 PeerValidatorError::InvalidMultiaddr("Address does not include a TCP port".to_string())
@@ -89,12 +152,9 @@ fn validate_address(addr: &Multiaddr, allow_test_addrs: bool) -> Result<(), Peer
             expect_end_of_address(addr_iter)
         },
 
-        Protocol::Ip4(addr) if !allow_test_addrs && addr.is_unspecified() => Err(PeerValidatorError::InvalidMultiaddr(
-            "Non-global IP addresses are invalid".to_string(),
-        )),
-        Protocol::Ip6(addr) if !allow_test_addrs && addr.is_unspecified() => Err(PeerValidatorError::InvalidMultiaddr(
-            "Non-global IP addresses are invalid".to_string(),
-        )),
+        Protocol::Ip4(_) | Protocol::Ip6(_) if !allow_test_addrs && !is_external_address(addr) => Err(
+            PeerValidatorError::InvalidMultiaddr("Non-global IP addresses are invalid".to_string()),
+        ),
         Protocol::Ip4(_) | Protocol::Ip6(_) => {
             let tcp = addr_iter.next().ok_or_else(|| {
                 PeerValidatorError::InvalidMultiaddr("Address does not include a TCP port".to_string())
@@ -205,6 +265,20 @@ mod test {
             "/onion/aaimaq4ygg2iegci:1234".parse().unwrap(),
             "/onion/aaimaq4ygg2iegci:1234/http".parse().unwrap(),
             multiaddr!(Dnsaddr("mike-magic-nodes.com")),
+            multiaddr!(Ip4([127, 0, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip4([10, 0, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip4([172, 16, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip4([192, 168, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip4([169, 254, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip6([0, 0, 0, 0, 0, 0, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip6([0xfc00, 0, 0, 0, 0, 0, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip6([0xfe80, 0, 0, 0, 0, 0, 0, 1]), Tcp(1u16)),
+            "/ip6/::ffff:127.0.0.1/tcp/1".parse().unwrap(),
+            "/ip6/::ffff:192.168.0.1/tcp/1".parse().unwrap(),
+            multiaddr!(Dns4("localhost"), Tcp(1u16)),
+            multiaddr!(Dns4("node.internal"), Tcp(1u16)),
+            multiaddr!(Dns6("printer.local"), Tcp(1u16)),
+            multiaddr!(Dnsaddr("home.arpa"), Tcp(1u16)),
             multiaddr!(Memory(1234u64)),
             multiaddr!(Memory(0u64)),
         ];
@@ -222,12 +296,24 @@ mod test {
         let valid = [
             multiaddr!(Ip4([127, 0, 0, 1]), Tcp(1u16)),
             multiaddr!(Ip4([169, 254, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip4([10, 0, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip4([172, 16, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip4([192, 168, 0, 1]), Tcp(1u16)),
             multiaddr!(Ip4([172, 0, 0, 1]), Tcp(1u16)),
             multiaddr!(Ip6([172, 0, 0, 1, 1, 1, 1, 1]), Tcp(1u16)),
+            multiaddr!(Ip6([0, 0, 0, 0, 0, 0, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip6([0xfc00, 0, 0, 0, 0, 0, 0, 1]), Tcp(1u16)),
+            multiaddr!(Ip6([0xfe80, 0, 0, 0, 0, 0, 0, 1]), Tcp(1u16)),
+            "/ip6/::ffff:127.0.0.1/tcp/1".parse().unwrap(),
+            "/ip6/::ffff:192.168.0.1/tcp/1".parse().unwrap(),
             "/onion3/vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd:1234"
                 .parse()
                 .unwrap(),
             multiaddr!(Dnsaddr("mike-magic-nodes.com"), Tcp(1u16)),
+            multiaddr!(Dns4("localhost"), Tcp(1u16)),
+            multiaddr!(Dns4("node.internal"), Tcp(1u16)),
+            multiaddr!(Dns6("printer.local"), Tcp(1u16)),
+            multiaddr!(Dnsaddr("home.arpa"), Tcp(1u16)),
             multiaddr!(Memory(1234u64)),
         ];
 
